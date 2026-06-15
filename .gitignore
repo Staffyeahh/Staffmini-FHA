@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+outputs/
+logs/
+*.pt
+*.pth
+*.safetensors
+events.out.tfevents*

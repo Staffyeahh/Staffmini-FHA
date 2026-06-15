@@ -1,0 +1,55 @@
+{
+  "dataset": "HuggingFaceTB/cosmopedia",
+  "split": "train",
+  "weights": {
+    "web_samples_v1": 35.0,
+    "web_samples_v2": 35.0,
+    "stories": 10.0,
+    "auto_math_text": 8.0,
+    "openstax": 4.0,
+    "khanacademy": 4.0,
+    "stanford": 2.0,
+    "wikihow": 2.0
+  },
+  "tokenizer": "data\\tokenizer\\staffyeahh_32k",
+  "text_key": "text",
+  "append_eos": true,
+  "seed": 42,
+  "target_tokens": 100000000,
+  "max_rows": 0,
+  "total_rows_seen": 129654,
+  "kept_rows": 129654,
+  "missing_or_empty_text_rows": 0,
+  "total_tokens": 100000417,
+  "dtype": "int32",
+  "per_subset_rows": {
+    "web_samples_v1": 45141,
+    "web_samples_v2": 45560,
+    "stories": 13124,
+    "auto_math_text": 10255,
+    "openstax": 5139,
+    "khanacademy": 5195,
+    "stanford": 2628,
+    "wikihow": 2612
+  },
+  "per_subset_tokens": {
+    "web_samples_v1": 35490767,
+    "web_samples_v2": 34858454,
+    "stories": 7536455,
+    "auto_math_text": 7581640,
+    "openstax": 4312118,
+    "khanacademy": 5032538,
+    "stanford": 2596513,
+    "wikihow": 2591932
+  },
+  "subset_draws": {
+    "web_samples_v1": 45141,
+    "web_samples_v2": 45560,
+    "stories": 13124,
+    "auto_math_text": 10255,
+    "openstax": 5139,
+    "khanacademy": 5195,
+    "stanford": 2628,
+    "wikihow": 2612
+  }
+}

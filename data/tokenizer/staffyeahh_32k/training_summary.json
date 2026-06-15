@@ -1,0 +1,11 @@
+{
+  "output_dir": "data\\tokenizer\\staffyeahh_32k",
+  "num_files": 1,
+  "vocab_size": 30293,
+  "special_tokens": [
+    "<unk>",
+    "<bos>",
+    "<eos>",
+    "<pad>"
+  ]
+}
