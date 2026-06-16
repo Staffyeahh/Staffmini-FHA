@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -13,6 +14,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from staffmini_fha import FHAConfig, FractalHybridForCausalLM
+from staffmini_fha.model import BlockCache
 
 
 def load_model(config_path: Path, checkpoint: Path, device: torch.device) -> FractalHybridForCausalLM:
@@ -38,23 +40,45 @@ def generate(
 ) -> str:
     device = next(model.parameters()).device
     ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+
+    amp_ctx = torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda")
+
+    # Prefill: run entire prompt through model with caching
+    with amp_ctx:
+        caches = [BlockCache() for _ in range(len(model.layers))]
+        for t in range(ids.shape[1]):
+            logits, caches = model.step(ids[:, t:t+1], caches)
+
     generated = ids
+
+    # Decode: one token at a time with caching
+    tok_start = time.perf_counter()
     for _ in range(max_new_tokens):
-        ctx = generated[:, -model.config.max_position_embeddings :]
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            logits = model(input_ids=ctx)["logits"][:, -1, :].float()
+        last_logits = logits[:, -1, :].float()
+
         if temperature <= 0:
-            next_token = logits.argmax(dim=-1, keepdim=True)
+            next_token = last_logits.argmax(dim=-1, keepdim=True)
         else:
-            logits = logits / temperature
+            last_logits = last_logits / temperature
             if top_k > 0:
-                cutoff = torch.topk(logits, min(top_k, logits.size(-1)))[0][:, -1:]
-                logits = torch.where(logits < cutoff, torch.full_like(logits, float("-inf")), logits)
-            probs = torch.softmax(logits, dim=-1)
+                cutoff = torch.topk(last_logits, min(top_k, last_logits.size(-1)))[0][:, -1:]
+                last_logits = torch.where(last_logits < cutoff, torch.full_like(last_logits, float("-inf")), last_logits)
+            probs = torch.softmax(last_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
+
         generated = torch.cat([generated, next_token], dim=-1)
+
         if tokenizer.eos_token_id is not None and next_token.item() == tokenizer.eos_token_id:
             break
+
+        with amp_ctx:
+            logits, caches = model.step(next_token, caches)
+
+    tok_elapsed = time.perf_counter() - tok_start
+    n_new = generated.shape[1] - ids.shape[1]
+    if tok_elapsed > 0 and n_new > 0:
+        print(f"\n[{n_new} tokens in {tok_elapsed:.2f}s = {n_new/tok_elapsed:.1f} tok/s]", file=sys.stderr)
+
     return tokenizer.decode(generated[0], skip_special_tokens=True)
 
 

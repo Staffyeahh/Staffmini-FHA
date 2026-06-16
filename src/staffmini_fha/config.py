@@ -66,17 +66,9 @@ class FHAConfig(PretrainedConfig):
 
         ffn_layout = ffn_layout or {}
         dense_ffn = ffn_layout.get("dense_ffn", {}) or {}
-        moe_ffn = ffn_layout.get("moe_ffn", {}) or {}
-        router_cfg = moe_ffn.get("router", {}) or {}
         self.first_n_dense_layers = int(ffn_layout.get("first_n_dense_layers", self.n_layers))
         self.dense_ffn_type = str(dense_ffn.get("type", "swiglu"))
         self.dense_ffn_hidden_size = int(dense_ffn.get("hidden_size", 1152))
-        self.num_routed_experts = int(moe_ffn.get("num_routed_experts", 1))
-        self.num_shared_experts = int(moe_ffn.get("num_shared_experts", 1))
-        self.top_k = int(moe_ffn.get("top_k", 1))
-        self.expert_hidden_size = int(moe_ffn.get("expert_hidden_size", 256))
-        self.aux_loss_weight = float(router_cfg.get("aux_loss_weight", 0.0))
-        self.z_loss_weight = float(router_cfg.get("z_loss_weight", 0.0))
 
         init = init or {}
         self.init_method = str(init.get("method", "xavier_uniform"))
@@ -96,6 +88,8 @@ class FHAConfig(PretrainedConfig):
         self.fha_anchor_temperature = float(fha.get("anchor_temperature", 1.0))
         self.fha_anchor_entropy_weight = float(fha.get("anchor_entropy_weight", 0.0))
         self.fha_anchor_prediction_weight = float(fha.get("anchor_prediction_weight", 0.0))
+        self.fha_use_rope = bool(fha.get("use_rope", False))
+        self.fha_rope_theta = float(fha.get("rope_theta", attention_layout.get("rope_theta", 10000.0)))
 
         mtp = mtp or {}
         self.mtp_enabled = bool(mtp.get("enabled", False))

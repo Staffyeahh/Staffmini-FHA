@@ -28,6 +28,38 @@ class RMSNorm(nn.Module):
         return x_norm * self.weight
 
 
+
+
+class RotaryPositionEmbedding(nn.Module):
+    """RoPE — rotates Q and K in pairs of dimensions."""
+
+    def __init__(self, dim: int, theta: float = 10000.0) -> None:
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # q, k: [batch, heads, seq, head_dim]
+        # positions: [batch, seq]
+        freqs = torch.einsum("bi,d->bid", positions.float(), self.inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)  # [batch, seq, dim]
+        cos = emb.cos().to(dtype=q.dtype)
+        sin = emb.sin().to(dtype=q.dtype)
+        return self._apply_rotary(q, cos, sin), self._apply_rotary(k, cos, sin)
+
+    @staticmethod
+    def _apply_rotary(
+        x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    ) -> torch.Tensor:
+        d = x.shape[-1]
+        x1, x2 = x[..., : d // 2], x[..., d // 2 :]
+        rotated = torch.cat([-x2, x1], dim=-1)
+        cos = cos[:, None, :, :]  # [batch, 1, seq, dim]
+        sin = sin[:, None, :, :]
+        return x * cos + rotated * sin
+
 class DenseSwiGLU(nn.Module):
     def __init__(self, d_model: int, hidden_size: int) -> None:
         super().__init__()
@@ -64,6 +96,21 @@ class CausalDepthwiseMixer(nn.Module):
         return self.out_proj(mixed)
 
 
+    def step(
+        self, x: torch.Tensor, cache: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-token inference with cache. x: [batch, 1, d_model]."""
+        normed = self.input_norm(x)
+        if cache is None:
+            conv_input = F.pad(normed.transpose(1, 2), (self.kernel_size - 1, 0))
+        else:
+            conv_input = torch.cat([cache.transpose(1, 2), normed.transpose(1, 2)], dim=2)
+        new_cache = conv_input[:, :, -(self.kernel_size - 1) :].transpose(1, 2)
+        local = self.depthwise(conv_input).transpose(1, 2)[:, -1:, :]
+        mixed = F.silu(local + self.value_proj(normed)) * torch.sigmoid(self.gate_proj(normed))
+        return self.out_proj(mixed), new_cache
+
+
 class MacroAnchorTransformer(nn.Module):
     def __init__(self, config: FHAConfig) -> None:
         super().__init__()
@@ -79,6 +126,11 @@ class MacroAnchorTransformer(nn.Module):
         self.o_proj = nn.Linear(config.d_model, config.d_model, bias=False)
         self.post_attn_norm = RMSNorm(config.d_model, eps=1e-6, zero_centered=config.zero_centered_rmsnorm)
         self.ffn = DenseSwiGLU(config.d_model, config.fha_macro_ffn_hidden_size)
+        self.rope: RotaryPositionEmbedding | None = None
+        if getattr(config, "fha_use_rope", False):
+            self.rope = RotaryPositionEmbedding(
+                self.head_dim, float(getattr(config, "fha_rope_theta", 10000.0))
+            )
 
     def forward(self, anchors: torch.Tensor) -> torch.Tensor:
         batch_size, num_anchors, _ = anchors.shape
@@ -86,11 +138,60 @@ class MacroAnchorTransformer(nn.Module):
         q = self.q_proj(normed).view(batch_size, num_anchors, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(normed).view(batch_size, num_anchors, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(normed).view(batch_size, num_anchors, self.num_heads, self.head_dim).transpose(1, 2)
-        attn = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=True, scale=self.scale)
+        if self.rope is not None:
+            positions = torch.arange(num_anchors, device=anchors.device).unsqueeze(0).expand(batch_size, -1)
+            q, k = self.rope(q, k, positions)
+        # Explicit causal mask: Q[i] at position K_len-Q_len+i attends to keys 0..K_len-Q_len+i
+        # is_causal=True assumes Q starts at pos 0, which is wrong with KV cache
+        q_len, k_len = q.shape[2], k.shape[2]
+        mask = torch.ones(q_len, k_len, dtype=torch.bool, device=q.device).tril(
+            diagonal=k_len - q_len
+        )
+        attn = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.0, scale=self.scale
+        )
         attn = attn.transpose(1, 2).reshape(batch_size, num_anchors, -1)
         anchors = anchors + self.o_proj(attn)
         anchors = anchors + self.ffn(self.post_attn_norm(anchors))
         return anchors
+
+
+    def step(
+        self,
+        anchors: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        anchor_offset: int = 0,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Single-anchor step with KV-cache. anchors: [batch, N_new, d_model]."""
+        batch_size, num_new, _ = anchors.shape
+        normed = self.input_norm(anchors)
+        q = self.q_proj(normed).view(batch_size, num_new, self.num_heads, self.head_dim).transpose(1, 2)
+        k_new = self.k_proj(normed).view(batch_size, num_new, self.num_heads, self.head_dim).transpose(1, 2)
+        v_new = self.v_proj(normed).view(batch_size, num_new, self.num_heads, self.head_dim).transpose(1, 2)
+        if self.rope is not None:
+            positions = torch.arange(
+                anchor_offset, anchor_offset + num_new, device=anchors.device
+            ).unsqueeze(0).expand(batch_size, -1)
+            q, k_new = self.rope(q, k_new, positions)
+        if kv_cache is not None:
+            k = torch.cat([kv_cache[0], k_new], dim=2)
+            v = torch.cat([kv_cache[1], v_new], dim=2)
+        else:
+            k, v = k_new, v_new
+        new_kv_cache = (k, v)
+        # Explicit causal mask: Q[i] at position K_len-Q_len+i attends to keys 0..K_len-Q_len+i
+        # is_causal=True assumes Q starts at pos 0, which is wrong with KV cache
+        q_len, k_len = q.shape[2], k.shape[2]
+        mask = torch.ones(q_len, k_len, dtype=torch.bool, device=q.device).tril(
+            diagonal=k_len - q_len
+        )
+        attn = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.0, scale=self.scale
+        )
+        attn = attn.transpose(1, 2).reshape(batch_size, num_new, -1)
+        out = anchors + self.o_proj(attn)
+        out = out + self.ffn(self.post_attn_norm(out))
+        return out, new_kv_cache
 
 
 class SelectiveMultiSlotAnchor(nn.Module):
@@ -218,6 +319,21 @@ class GatedDeltaAnchor(nn.Module):
         return anchor, entropy
 
 
+
+
+from dataclasses import dataclass
+
+@dataclass
+class BlockCache:
+    """Per-layer cache for incremental inference."""
+    micro_cache: torch.Tensor | None = None
+    anchor_buffer: torch.Tensor | None = None
+    anchor_count: int = 0
+    macro_kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None
+    macro_anchor_offset: int = 0
+    prev_macro: torch.Tensor | None = None
+
+
 class FractalHybridBlock(nn.Module):
     def __init__(self, config: FHAConfig) -> None:
         super().__init__()
@@ -275,6 +391,79 @@ class FractalHybridBlock(nn.Module):
         return hidden_states, gate.detach(), anchor_entropy.detach(), anchor_prediction_loss
 
 
+    def step(
+        self,
+        hidden_states: torch.Tensor,
+        cache: BlockCache | None = None,
+        global_anchor_offset: int = 0,
+    ) -> tuple[torch.Tensor, BlockCache]:
+        """Single-token step with caching.
+
+        Feedback semantics match _broadcast_previous_guidance:
+        - Block 0: NO feedback (previous = zeros)
+        - Block N: feedback from block N-1's macro output
+
+        Every token is emitted immediately with correct feedback.
+        """
+        if cache is None:
+            cache = BlockCache()
+
+        # 1. Micro mixer with cache
+        micro_out, new_micro_cache = self.micro.step(hidden_states, cache.micro_cache)
+        h = hidden_states + micro_out
+
+        # 2. Accumulate in anchor buffer
+        if cache.anchor_buffer is None:
+            anchor_buffer = h
+        else:
+            anchor_buffer = torch.cat([cache.anchor_buffer, h], dim=1)
+        anchor_count = cache.anchor_count + 1
+
+        new_macro_kv = cache.macro_kv_cache
+        macro_offset = cache.macro_anchor_offset
+        # Save previous feedback BEFORE any overwrites
+        prev_feedback = cache.prev_macro
+        next_feedback = prev_feedback  # default: carry forward
+        anchor_entropy = h.new_zeros(())
+        anchor_pred_loss = h.new_zeros(())
+
+        # 3. If we have enough tokens -> trigger anchor and compute macro
+        if anchor_count >= self.anchor_stride:
+            anchors, anchor_entropy = self.anchor_compressor(anchor_buffer)
+            anchor_pred_loss = self._anchor_prediction_loss(anchors)
+
+            macro_out, new_macro_kv = self.macro.step(
+                anchors, kv_cache=new_macro_kv,
+                anchor_offset=global_anchor_offset + macro_offset,
+            )
+            macro_offset += anchors.shape[1]
+            # Current block used prev_feedback; next block gets macro_out
+            next_feedback = macro_out
+            anchor_buffer = None
+            anchor_count = 0
+
+        # 4. Apply feedback from PREVIOUS block's macro output
+        if prev_feedback is not None:
+            guidance = self.feedback_norm(prev_feedback[:, -1:, :])
+            feedback = self.feedback_proj(guidance)
+            gate = torch.sigmoid(self.feedback_gate)
+            h = h + gate * feedback
+
+        # 5. FFN
+        h = h + self.ffn(self.post_micro_norm(h))
+
+        new_cache = BlockCache(
+            micro_cache=new_micro_cache,
+            anchor_buffer=anchor_buffer,
+            anchor_count=anchor_count,
+            macro_kv_cache=new_macro_kv,
+            macro_anchor_offset=macro_offset,
+            prev_macro=next_feedback,
+        )
+        gate_val = torch.sigmoid(self.feedback_gate).detach()
+        return h, gate_val, anchor_entropy.detach(), anchor_pred_loss, new_cache
+
+
 class FractalHybridForCausalLM(nn.Module):
     @property
     def device(self) -> torch.device:
@@ -285,7 +474,6 @@ class FractalHybridForCausalLM(nn.Module):
         self.config = config
         self.gradient_checkpointing = False
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.d_model)
         self.layers = nn.ModuleList([FractalHybridBlock(config) for _ in range(config.n_layers)])
         self.final_norm = RMSNorm(config.d_model, eps=1e-6, zero_centered=config.zero_centered_rmsnorm)
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=config.lm_head_bias)
@@ -302,8 +490,6 @@ class FractalHybridForCausalLM(nn.Module):
                     nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=self.config.embed_std)
         if not self.config.tie_word_embeddings:
             nn.init.normal_(self.lm_head.weight, mean=0.0, std=self.config.lm_head_std)
 
@@ -316,9 +502,52 @@ class FractalHybridForCausalLM(nn.Module):
     def gradient_checkpointing_disable(self) -> None:
         self.gradient_checkpointing = False
 
-    def get_expert_weight_norms_by_layer(self) -> tuple[None, None]:
-        return None, None
 
+
+    @torch.no_grad()
+    def prefill(
+        self, input_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, list[BlockCache]]:
+        """Run full prompt through the model, return logits and per-layer caches."""
+        hidden_states = self.embed_tokens(input_ids)
+        caches: list[BlockCache] = []
+        for block in self.layers:
+            # Run full forward to fill caches efficiently
+            hidden_states, gate, entropy, pred_loss = block(hidden_states)
+            # Build initial cache from the last anchor state
+            # We need to re-run in step mode to get proper caches
+            caches.append(BlockCache())
+        hidden_states = self.final_norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+        return logits, caches
+
+    @torch.no_grad()
+    def step(
+        self,
+        input_ids: torch.Tensor,
+        caches: list[BlockCache],
+        anchor_offsets: list[int] | None = None,
+    ) -> tuple[torch.Tensor, list[BlockCache]]:
+        """Single-token step with caching. input_ids: [batch, 1].
+
+        Returns logits for ALL emitted tokens (may be >1 when anchor triggers).
+        The LAST logit row corresponds to the newest token.
+        """
+        if anchor_offsets is None:
+            anchor_offsets = [0] * len(self.layers)
+        hidden_states = self.embed_tokens(input_ids)
+        new_caches: list[BlockCache] = []
+        for i, block in enumerate(self.layers):
+            out_h, gate, entropy, pred_loss, new_cache = block.step(
+                hidden_states, caches[i], global_anchor_offset=anchor_offsets[i]
+            )
+            # out_h may contain multiple tokens (when anchor triggers)
+            # For subsequent layers, use the full output
+            hidden_states = out_h
+            new_caches.append(new_cache)
+        hidden_states = self.final_norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+        return logits, new_caches
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -329,12 +558,7 @@ class FractalHybridForCausalLM(nn.Module):
         if input_ids.ndim != 2:
             raise ValueError(f"Expected input_ids with shape [batch, seq], got {tuple(input_ids.shape)}.")
         batch_size, seq_len = input_ids.shape
-        if seq_len > self.config.max_position_embeddings:
-            raise ValueError(
-                f"Sequence length {seq_len} exceeds max_position_embeddings={self.config.max_position_embeddings}."
-            )
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
-        hidden_states = self.embed_tokens(input_ids) + self.position_embeddings(positions)
+        hidden_states = self.embed_tokens(input_ids)
 
         feedback_gates: list[torch.Tensor] = []
         anchor_entropies: list[torch.Tensor] = []
@@ -390,20 +614,7 @@ class FractalHybridForCausalLM(nn.Module):
                 "loss": loss,
                 "logits": logits,
                 "lm_loss": lm_loss,
-                "moe_aux_loss": zero,
-                "moe_z_loss": zero,
-                "moe_loss": zero,
-                "mtp_loss": None,
-                "mtp_loss_per_token": None,
-                "router_token_counts": None,
-                "router_entropy": None,
-                "moe_layer_indices": None,
-                "moe_token_counts_by_layer": None,
-                "moe_router_entropy_by_layer": None,
-                "moe_expert_output_norms_by_layer": None,
-                "moe_capacity_overflow_rate_by_layer": None,
-                "moe_max_to_median_norm_ratio_by_layer": None,
-                "lm_loss_per_token": lm_loss_per_token if return_per_token_losses else lm_loss_per_token,
+                "lm_loss_per_token": lm_loss_per_token if return_per_token_losses else None,
                 "fha_feedback_gate": torch.stack(feedback_gates).mean() if feedback_gates else zero,
                 "fha_anchor_entropy": torch.stack(anchor_entropies).mean() if anchor_entropies else zero,
                 "fha_anchor_prediction_loss": anchor_prediction_loss,

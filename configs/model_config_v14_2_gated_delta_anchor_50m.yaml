@@ -9,7 +9,6 @@ norm_type: rmsnorm
 zero_centered_rmsnorm: true
 residual_in_fp32: false
 lm_head_bias: false
-
 attention_layout:
   type: fha
   query_heads_full: 6
@@ -20,7 +19,6 @@ attention_layout:
   rope_dims:
     full: 64
     swa: 64
-
 ffn_layout:
   first_n_dense_layers: 8
   dense_ffn:
@@ -34,12 +32,10 @@ ffn_layout:
     router:
       aux_loss_weight: 0.0
       z_loss_weight: 0.0
-
 init:
   method: xavier_uniform
   embed_std: 0.02
   lm_head_std: 0.02
-
 fha:
   enabled: true
   anchor_type: gated_delta
@@ -51,6 +47,7 @@ fha:
   micro_ffn_hidden_size: 1152
   macro_ffn_hidden_size: 768
   feedback_init: -2.0
-
+  use_rope: true
+  rope_theta: 10000
 mtp:
   enabled: false

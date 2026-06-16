@@ -1,4 +1,4 @@
-model_name: mini_fha_50m_v14_lite_sample25
+model_name: mini_fha_50m_v14_2_gated_delta_anchor_sample25
 vocab_size: 30294
 tie_word_embeddings: true
 max_position_embeddings: 4096
@@ -38,9 +38,10 @@ init:
   lm_head_std: 0.02
 fha:
   enabled: true
-  anchor_type: mean
+  anchor_type: gated_delta
   anchor_stride: 16
   anchor_slots: 1
+  anchor_temperature: 0.75
   micro_kernel_size: 5
   macro_heads: 6
   micro_ffn_hidden_size: 1152
@@ -48,5 +49,6 @@ fha:
   feedback_init: -2.0
   use_rope: true
   rope_theta: 10000
+  anchor_prediction_weight: 0.1
 mtp:
   enabled: false
