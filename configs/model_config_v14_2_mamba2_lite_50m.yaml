@@ -1,0 +1,58 @@
+model_name: mini_fha_50m_v14_2_mamba2_lite
+vocab_size: 30294
+tie_word_embeddings: true
+max_position_embeddings: 4096
+d_model: 384
+n_layers: 8
+head_dim: 64
+norm_type: rmsnorm
+zero_centered_rmsnorm: true
+residual_in_fp32: false
+lm_head_bias: false
+attention_layout:
+  type: fha
+  query_heads_full: 6
+  query_heads_swa: 6
+  kv_heads: 6
+  head_wise_output_gate: false
+  rope_theta: 10000
+  rope_dims:
+    full: 64
+    swa: 64
+ffn_layout:
+  first_n_dense_layers: 8
+  dense_ffn:
+    type: swiglu
+    hidden_size: 1152
+  moe_ffn:
+    num_routed_experts: 1
+    num_shared_experts: 1
+    top_k: 1
+    expert_hidden_size: 256
+    router:
+      aux_loss_weight: 0.0
+      z_loss_weight: 0.0
+init:
+  method: xavier_uniform
+  embed_std: 0.02
+  lm_head_std: 0.02
+fha:
+  enabled: true
+  micro_type: mamba2
+  mamba_d_state: 8
+  mamba_d_conv: 4
+  mamba_expand: 1
+  anchor_type: gated_delta
+  anchor_stride: 16
+  anchor_slots: 1
+  anchor_temperature: 0.75
+  micro_kernel_size: 5
+  macro_heads: 6
+  micro_ffn_hidden_size: 1152
+  macro_ffn_hidden_size: 768
+  feedback_init: -2.0
+  anchor_prediction_weight: 0.1
+  use_rope: true
+  rope_theta: 10000
+mtp:
+  enabled: false

@@ -72,6 +72,67 @@ class DenseSwiGLU(nn.Module):
 
 
 
+
+
+class FlaMamba2Mixer(nn.Module):
+    """Mamba-2 micro mixer using fla (Flash Linear Attention) Triton kernels.
+
+    Drop-in replacement for CausalDepthwiseMixer.
+    Uses fla.layers.Mamba2 for both training and inference.
+    """
+
+    def __init__(self, config: FHAConfig) -> None:
+        super().__init__()
+        self.d_model = config.d_model
+        expand = int(getattr(config, "fha_mamba_expand", 1))
+        d_state = int(getattr(config, "fha_mamba_d_state", 8))
+        d_conv = int(getattr(config, "fha_mamba_d_conv", 4))
+        d_inner = self.d_model * expand
+
+        # Calculate head_dim and num_heads for fla
+        head_dim = max(1, d_inner // 8)
+        num_heads = d_inner // head_dim
+
+        from fla.layers import Mamba2 as FlaMamba2
+        self.mamba = FlaMamba2(
+            hidden_size=self.d_model,
+            expand=expand,
+            state_size=d_state,
+            conv_kernel=d_conv,
+            head_dim=head_dim,
+            num_heads=num_heads,
+            backend='cuda',
+        )
+        self.d_conv = d_conv
+        self.d_inner = d_inner
+        self.d_state = d_state
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using fla Triton kernels."""
+        output, _, _ = self.mamba(x)
+        return output
+
+    def step(
+        self, x: torch.Tensor, cache: dict | None = None,
+    ) -> tuple[torch.Tensor, dict | None]:
+        """Single-token inference using fla's built-in decode path.
+
+        x: [batch, 1, d_model]
+        cache: fla cache dict or None
+        returns: (output [batch, 1, d_model], new_cache)
+        """
+        import torch.nn.functional as F
+
+        if cache is None:
+            # First call: initialize cache from prefill
+            # Run full forward with use_cache to get initial state
+            output, _, cache = self.mamba(x, use_cache=True)
+            return output, cache
+        else:
+            # Subsequent calls: single-token decode
+            output, _, cache = self.mamba(x, past_key_values=cache, use_cache=True)
+            return output, cache
+
 class Mamba2Mixer(nn.Module):
     """Mamba-2 micro mixer using SSD (Structured State Space Duality).
 
@@ -177,13 +238,18 @@ class Mamba2Mixer(nn.Module):
 
         # State recurrence: h_t = A_bar * h_{t-1} + B_bar * x_t
         # y_t = C_t @ h_t
-        h = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=x.dtype)
+        # Gradient-safe: pre-allocate output, no in-place on autograd graph
+        dBx = dB * x[:, :, :, None]  # [batch, seq, d_inner, d_state]
+        h = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=torch.float32)
+        dA_f = dA.float()
+        dBx_f = dBx.float()
+        C_f = C.float()
         ys = []
         for t in range(seq_len):
-            h = dA[:, t] * h + dB[:, t] * x[:, t, :, None]  # [batch, d_inner, d_state]
-            y_t = (h * C[:, t, None, :]).sum(dim=-1)  # [batch, d_inner]
+            h = dA_f[:, t] * h + dBx_f[:, t]
+            y_t = (h * C_f[:, t, None, :]).sum(dim=-1)
             ys.append(y_t)
-        return torch.stack(ys, dim=1)  # [batch, seq, d_inner]
+        return torch.stack(ys, dim=1).to(dtype=x.dtype)
 
     def step(
         self, x: torch.Tensor, cache: torch.Tensor | None = None,
@@ -516,7 +582,7 @@ class FractalHybridBlock(nn.Module):
         self.anchor_stride = int(config.fha_anchor_stride)
         self.anchor_slots = max(1, int(config.fha_anchor_slots))
         if getattr(config, "fha_micro_type", "conv1d") == "mamba2":
-            self.micro = Mamba2Mixer(config)
+            self.micro = FlaMamba2Mixer(config)
         else:
             self.micro = CausalDepthwiseMixer(config)
         if config.fha_anchor_type == "mean":
