@@ -219,7 +219,11 @@ class Mamba2Mixer(nn.Module):
         self, x: torch.Tensor, dt: torch.Tensor, A: torch.Tensor,
         B: torch.Tensor, C: torch.Tensor,
     ) -> torch.Tensor:
-        """Selective scan — sequential for correctness.
+        """Selective scan — chunked for speed.
+
+        Splits sequence into chunks, uses torch.bmm within each chunk,
+        transfers boundary states between chunks.
+        Reduces iterations from seq_len to seq_len/chunk_size.
 
         x: [batch, seq, d_inner]
         dt: [batch, seq, d_inner]
@@ -230,26 +234,65 @@ class Mamba2Mixer(nn.Module):
         """
         batch, seq_len, d_inner = x.shape
         d_state = A.shape[1]
+        chunk_size = 64  # tune this
 
-        # Discretize: A_bar = exp(dt * A), B_bar = dt * B
-        dtA = torch.einsum("bld,dn->bldn", dt, A)  # [batch, seq, d_inner, d_state]
-        dA = torch.exp(dtA)  # [batch, seq, d_inner, d_state]
-        dB = torch.einsum("bld,bln->bldn", dt, B)  # [batch, seq, d_inner, d_state]
-
-        # State recurrence: h_t = A_bar * h_{t-1} + B_bar * x_t
-        # y_t = C_t @ h_t
-        # Gradient-safe: pre-allocate output, no in-place on autograd graph
-        dBx = dB * x[:, :, :, None]  # [batch, seq, d_inner, d_state]
-        h = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=torch.float32)
-        dA_f = dA.float()
-        dBx_f = dBx.float()
+        # Discretize
+        dA = torch.exp(torch.einsum("bld,dn->bldn", dt, A).float())  # [B, L, D, N]
+        dBx = torch.einsum("bld,bln,bld->bldn", dt, B, x).float()   # [B, L, D, N]
         C_f = C.float()
+
+        # Pad to multiple of chunk_size
+        n_chunks = (seq_len + chunk_size - 1) // chunk_size
+        pad_len = n_chunks * chunk_size - seq_len
+        if pad_len > 0:
+            dA = torch.nn.functional.pad(dA, (0, 0, 0, 0, 0, pad_len))
+            dBx = torch.nn.functional.pad(dBx, (0, 0, 0, 0, 0, pad_len))
+            C_f = torch.nn.functional.pad(C_f, (0, 0, 0, pad_len))
+
+        # Reshape into chunks: [B, n_chunks, chunk_size, D, N]
+        dA = dA.view(batch, n_chunks, chunk_size, d_inner, d_state)
+        dBx = dBx.view(batch, n_chunks, chunk_size, d_inner, d_state)
+        C_f = C_f.view(batch, n_chunks, chunk_size, d_state)
+
+        # Within each chunk: compute states using prefix products
+        # h_t = dA_t * h_{t-1} + dBx_t
+        # For a chunk of size K, we need K sequential steps
+        # But we can vectorize within the chunk using cumulative products
+
+        # Compute cumulative products of dA within each chunk
+        log_dA = torch.log(dA.clamp(min=1e-20))  # [B, C, K, D, N]
+        cum_log_dA = torch.cumsum(log_dA, dim=2)  # [B, C, K, D, N]
+        cum_dA = torch.exp(cum_log_dA)             # [B, C, K, D, N]
+
+        # Within-chunk states (assuming h_0 = 0 for each chunk)
+        # h_t = sum_{s<=t} exp(sum_{u=s+1..t} log_dA_u) * dBx_s
+        #     = cum_dA[t] * sum_{s<=t} (dBx_s / cum_dA[s])
+        inv_cum_dA = 1.0 / cum_dA.clamp(min=1e-20)
+        weighted_dBx = inv_cum_dA * dBx  # [B, C, K, D, N]
+        cum_weighted = torch.cumsum(weighted_dBx, dim=2)  # [B, C, K, D, N]
+        h_within = cum_dA * cum_weighted  # [B, C, K, D, N]
+
+        # Output within each chunk
+        y_within = (h_within * C_f[:, :, :, None, :]).sum(dim=-1)  # [B, C, K, D]
+
+        # Transfer boundary states between chunks
+        # Last state of chunk i becomes initial state of chunk i+1
+        h_boundary = h_within[:, :, -1, :, :]  # [B, C, D, N]
+
+        # Propagate boundaries
+        h_prev = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=torch.float32)
         ys = []
-        for t in range(seq_len):
-            h = dA_f[:, t] * h + dBx_f[:, t]
-            y_t = (h * C_f[:, t, None, :]).sum(dim=-1)
-            ys.append(y_t)
-        return torch.stack(ys, dim=1).to(dtype=x.dtype)
+        for c in range(n_chunks):
+            # Add boundary from previous chunk
+            # h_total = h_within + cum_dA * h_prev
+            correction = cum_dA[:, c] * h_prev[:, None, :, :]  # [B, K, D, N]
+            h_total = h_within[:, c] + correction  # [B, K, D, N]
+            y_total = (h_total * C_f[:, c, :, None, :]).sum(dim=-1)  # [B, K, D]
+            ys.append(y_total)
+            h_prev = h_boundary[:, c]  # [B, D, N]
+
+        y = torch.cat(ys, dim=1)[:, :seq_len]  # [B, L, D]
+        return y.to(dtype=x.dtype)
 
     def step(
         self, x: torch.Tensor, cache: torch.Tensor | None = None,
@@ -582,7 +625,7 @@ class FractalHybridBlock(nn.Module):
         self.anchor_stride = int(config.fha_anchor_stride)
         self.anchor_slots = max(1, int(config.fha_anchor_slots))
         if getattr(config, "fha_micro_type", "conv1d") == "mamba2":
-            self.micro = FlaMamba2Mixer(config)
+            self.micro = Mamba2Mixer(config)
         else:
             self.micro = CausalDepthwiseMixer(config)
         if config.fha_anchor_type == "mean":
