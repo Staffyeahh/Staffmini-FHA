@@ -1,0 +1,29 @@
+seed: 42
+precision: bf16
+gradient_checkpointing: false
+torch_compile: false
+fp8_training: false
+num_workers: 2
+empty_cache_every: 0
+
+sequence_length: 512
+micro_batch_size: 16
+gradient_accumulation_steps: 5
+
+optimizer: adamw
+learning_rate: 1.0e-4
+weight_decay: 0.1
+betas: [0.9, 0.95]
+
+lr_scheduler: wsd
+warmup_ratio: 0.03
+wsd_stable_ratio: 0.70
+schedule_steps: 300
+
+max_grad_norm: 1.0
+slm_token_ratio: 0.0
+
+max_steps: 300
+log_every: 50
+moe_log_every: 999999
+save_every: 100
