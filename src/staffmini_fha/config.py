@@ -89,6 +89,10 @@ class FHAConfig(PretrainedConfig):
         self.fha_anchor_entropy_weight = float(fha.get("anchor_entropy_weight", 0.0))
         self.fha_anchor_prediction_weight = float(fha.get("anchor_prediction_weight", 0.0))
         self.fha_use_rope = bool(fha.get("use_rope", False))
+        self.fha_micro_type = str(fha.get("micro_type", "conv1d"))
+        self.fha_mamba_d_state = int(fha.get("mamba_d_state", 16))
+        self.fha_mamba_d_conv = int(fha.get("mamba_d_conv", 4))
+        self.fha_mamba_expand = int(fha.get("mamba_expand", 2))
         self.fha_rope_theta = float(fha.get("rope_theta", attention_layout.get("rope_theta", 10000.0)))
 
         mtp = mtp or {}

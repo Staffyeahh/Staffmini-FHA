@@ -71,6 +71,181 @@ class DenseSwiGLU(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+
+class Mamba2Mixer(nn.Module):
+    """Mamba-2 micro mixer using SSD (Structured State Space Duality).
+
+    Pure PyTorch implementation — no custom CUDA kernels.
+    Drop-in replacement for CausalDepthwiseMixer with same interface:
+      forward(x) -> output
+      step(x, cache) -> (output, new_cache)
+    """
+
+    def __init__(self, config: FHAConfig) -> None:
+        super().__init__()
+        self.d_model = config.d_model
+        self.d_state = int(getattr(config, "fha_mamba_d_state", 16))
+        self.d_conv = int(getattr(config, "fha_mamba_d_conv", 4))
+        self.expand = int(getattr(config, "fha_mamba_expand", 2))
+        self.d_inner = self.d_model * self.expand
+        self.dt_rank = max(1, self.d_model // 16)
+
+        self.input_norm = RMSNorm(config.d_model, eps=1e-6, zero_centered=config.zero_centered_rmsnorm)
+
+        # Input projection: x -> [z, x_proj] (gated)
+        self.in_proj = nn.Linear(config.d_model, self.d_inner * 2, bias=False)
+
+        # Conv1d for local context (no built-in padding — we do manual causal pad)
+        self.conv1d = nn.Conv1d(
+            self.d_inner, self.d_inner, kernel_size=self.d_conv,
+            groups=self.d_inner, padding=0, bias=True,
+        )
+
+        # SSM parameters
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+
+        # A parameter (log-space for stability)
+        A = torch.arange(1, self.d_state + 1, dtype=torch.float32).unsqueeze(0).expand(self.d_inner, -1)
+        self.A_log = nn.Parameter(torch.log(A))
+
+        # D parameter (skip connection)
+        self.D = nn.Parameter(torch.ones(self.d_inner))
+
+        # Output projection
+        self.out_proj = nn.Linear(self.d_inner, config.d_model, bias=False)
+
+        # Initialize dt bias for stability
+        with torch.no_grad():
+            dt_init_std = self.dt_rank ** -0.5
+            nn.init.uniform_(self.dt_proj.bias, -dt_init_std, dt_init_std)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch, seq_len, _ = x.shape
+        normed = self.input_norm(x)
+
+        # Input projection with gating
+        xz = self.in_proj(normed)  # [batch, seq, 2*d_inner]
+        x_proj, z = xz.chunk(2, dim=-1)  # each [batch, seq, d_inner]
+
+        # Conv1d (causal — manual left-pad, no built-in padding)
+        x_conv = x_proj.transpose(1, 2)  # [batch, d_inner, seq]
+        x_conv = F.pad(x_conv, (self.d_conv - 1, 0))  # causal left-pad
+        x_conv = self.conv1d(x_conv)  # [batch, d_inner, seq]
+        x_conv = x_conv.transpose(1, 2)  # [batch, seq, d_inner]
+        x_conv = F.silu(x_conv)
+
+        # SSM parameters
+        x_ssm = self.x_proj(x_conv)  # [batch, seq, dt_rank + 2*d_state]
+        dt, B, C = x_ssm.split([self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = self.dt_proj(dt)  # [batch, seq, d_inner]
+        dt = F.softplus(dt)  # ensure positive
+
+        # A (negative for stability)
+        A = -torch.exp(self.A_log)  # [d_inner, d_state]
+
+        # Selective scan (sequential — O(seq_len * d_inner * d_state))
+        # For training, this is the bottleneck. For inference, O(1) per token.
+        y = self._selective_scan(x_conv, dt, A, B, C)
+
+        # Skip connection + gate
+        y = y + self.D.unsqueeze(0).unsqueeze(0) * x_conv
+        y = y * F.silu(z)
+
+        return self.out_proj(y)
+
+    def _selective_scan(
+        self, x: torch.Tensor, dt: torch.Tensor, A: torch.Tensor,
+        B: torch.Tensor, C: torch.Tensor,
+    ) -> torch.Tensor:
+        """Selective scan — sequential for correctness.
+
+        x: [batch, seq, d_inner]
+        dt: [batch, seq, d_inner]
+        A: [d_inner, d_state]
+        B: [batch, seq, d_state]
+        C: [batch, seq, d_state]
+        returns: [batch, seq, d_inner]
+        """
+        batch, seq_len, d_inner = x.shape
+        d_state = A.shape[1]
+
+        # Discretize: A_bar = exp(dt * A), B_bar = dt * B
+        dtA = torch.einsum("bld,dn->bldn", dt, A)  # [batch, seq, d_inner, d_state]
+        dA = torch.exp(dtA)  # [batch, seq, d_inner, d_state]
+        dB = torch.einsum("bld,bln->bldn", dt, B)  # [batch, seq, d_inner, d_state]
+
+        # State recurrence: h_t = A_bar * h_{t-1} + B_bar * x_t
+        # y_t = C_t @ h_t
+        h = torch.zeros(batch, d_inner, d_state, device=x.device, dtype=x.dtype)
+        ys = []
+        for t in range(seq_len):
+            h = dA[:, t] * h + dB[:, t] * x[:, t, :, None]  # [batch, d_inner, d_state]
+            y_t = (h * C[:, t, None, :]).sum(dim=-1)  # [batch, d_inner]
+            ys.append(y_t)
+        return torch.stack(ys, dim=1)  # [batch, seq, d_inner]
+
+    def step(
+        self, x: torch.Tensor, cache: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Single-token inference with O(1) state update.
+
+        x: [batch, 1, d_model]
+        cache: [batch, d_inner, d_state] (SSM hidden state)
+        returns: (output [batch, 1, d_model], new_cache)
+        """
+        batch = x.shape[0]
+        normed = self.input_norm(x)
+
+        xz = self.in_proj(normed)
+        x_proj, z = xz.chunk(2, dim=-1)
+
+        # Conv1d: need last d_conv-1 tokens in cache
+        # For simplicity, we store the conv cache separately
+        # But for Mamba-2, the SSM state IS the main cache
+        # We'll use a combined cache: (ssm_state, conv_buffer)
+        if cache is None:
+            ssm_state = torch.zeros(batch, self.d_inner, self.d_state, device=x.device, dtype=x.dtype)
+            conv_buf = torch.zeros(batch, self.d_inner, self.d_conv - 1, device=x.device, dtype=x.dtype)
+        else:
+            ssm_state, conv_buf = cache
+
+        # Conv1d step — use same conv1d on the d_conv window
+        x_conv = x_proj.transpose(1, 2)  # [batch, d_inner, 1]
+        conv_input = torch.cat([conv_buf, x_conv], dim=2)  # [batch, d_inner, d_conv]
+        new_conv_buf = conv_input[:, :, 1:]  # [batch, d_inner, d_conv-1]
+        x_conv = self.conv1d(conv_input)  # [batch, d_inner, 1]
+        x_conv = F.silu(x_conv).transpose(1, 2)  # [batch, 1, d_inner]
+
+        # SSM parameters
+        x_ssm = self.x_proj(x_conv)  # [batch, 1, dt_rank + 2*d_state]
+        dt, B, C = x_ssm.split([self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = F.softplus(self.dt_proj(dt))  # [batch, 1, d_inner]
+
+        A = -torch.exp(self.A_log)  # [d_inner, d_state]
+
+        # Discretize
+        # dt: [batch, 1, d_inner], A: [d_inner, d_state], B: [batch, 1, d_state], C: [batch, 1, d_state]
+        dt_sq = dt.squeeze(1)  # [batch, d_inner]
+        B_sq = B.squeeze(1)    # [batch, d_state]
+        C_sq = C.squeeze(1)    # [batch, d_state]
+
+        dA = torch.exp(dt_sq.unsqueeze(-1) * A)       # [batch, d_inner, d_state]
+        dB = dt_sq.unsqueeze(-1) * B_sq.unsqueeze(1)   # [batch, d_inner, d_state]
+
+        # State update: h = A_bar * h + B_bar * x
+        x_in = x_conv.squeeze(1)  # [batch, d_inner]
+        new_state = dA * ssm_state + dB * x_in.unsqueeze(-1)  # [batch, d_inner, d_state]
+
+        # Output: y = C @ h + D * x
+        y = (new_state * C_sq.unsqueeze(1)).sum(dim=-1)  # [batch, d_inner]
+        y = y + self.D * x_conv.squeeze(1)
+        y = y * F.silu(z.squeeze(1))
+
+        output = self.out_proj(y.unsqueeze(1))  # [batch, 1, d_model]
+        new_cache = (new_state, new_conv_buf)
+        return output, new_cache
+
 class CausalDepthwiseMixer(nn.Module):
     def __init__(self, config: FHAConfig) -> None:
         super().__init__()
@@ -340,7 +515,10 @@ class FractalHybridBlock(nn.Module):
         self.config = config
         self.anchor_stride = int(config.fha_anchor_stride)
         self.anchor_slots = max(1, int(config.fha_anchor_slots))
-        self.micro = CausalDepthwiseMixer(config)
+        if getattr(config, "fha_micro_type", "conv1d") == "mamba2":
+            self.micro = Mamba2Mixer(config)
+        else:
+            self.micro = CausalDepthwiseMixer(config)
         if config.fha_anchor_type == "mean":
             self.anchor_compressor = MeanAnchor(config)
             self.anchor_slots = 1
